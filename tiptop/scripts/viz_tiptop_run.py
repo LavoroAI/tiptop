@@ -25,6 +25,19 @@ from tiptop.viz_utils import get_heatmap, get_gripper_mesh
 _log = logging.getLogger(__name__)
 
 
+def parse_grasped_object(label: str) -> str:
+    """Return the first argument of an action label, e.g. "crackers_in_wrapper" from
+    "Pick(crackers_in_wrapper, grasp1, q1)".
+
+    Matches up to the first comma rather than \\w+ so names with apostrophes like "Rubik's_cube"
+    aren't truncated, and strips surrounding whitespace so the result is a clean object key.
+    """
+    match = re.match(r"\w+\(([^,]+),", label)
+    if match is None:
+        raise ValueError(f"Could not parse object name from label: {label!r}")
+    return match.group(1).strip()
+
+
 def viz_grasps(grasps, num_grasps_per_object: int):
     """Visualize grasps"""
     gripper_mesh = get_gripper_mesh()
@@ -96,11 +109,7 @@ def viz_tiptop_plan(tiptop_plan: dict, cutamp_env: TAMPEnvironment, robot_rr: Re
 
         elif action_dict["type"] == "gripper":
             if action_dict["action"] == "close":
-                # Parse object name from label e.g. "Pick(crackers_in_wrapper, grasp1, q1)"
-                match = re.match(r"\w+\((\w+)", action_dict["label"])
-                if match is None:
-                    raise ValueError(f"Could not parse object name from label: {action_dict['label']}")
-                grasped_obj = match.group(1)
+                grasped_obj = parse_grasped_object(action_dict["label"])
                 world_from_ee = (
                     kin_model.get_state(torch.tensor(last_q, device=device)[None]).ee_pose.get_matrix()[0].cpu().numpy()
                 )
