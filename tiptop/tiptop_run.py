@@ -13,6 +13,7 @@ import aiohttp
 import numpy as np
 import open3d as o3d
 import rerun as rr
+import trimesh
 import tyro
 from curobo.geom.types import Cuboid, Mesh
 from curobo.types.base import TensorDeviceType
@@ -39,7 +40,12 @@ from tiptop.perception.cameras import (
 )
 from tiptop.perception.m2t2 import m2t2_to_tiptop_transform
 from tiptop.perception.sam2 import sam2_client
-from tiptop.perception.segmentation import segment_pointcloud_by_masks, segment_table_with_ransac
+from tiptop.perception.segmentation import (
+    masked_object_points,
+    segment_pointcloud_by_masks,
+    segment_table_with_ransac,
+)
+from tiptop.perception.shape_completion import reconstruct_objects_with_recgen
 from tiptop.perception.utils import convert_trimesh_box_to_curobo_cuboid, convert_trimesh_to_curobo_mesh
 from tiptop.perception_wrapper import detect_and_segment, predict_depth_and_grasps
 from tiptop.planning import build_tamp_config, run_planning, save_tiptop_plan, serialize_plan
@@ -138,6 +144,13 @@ def get_demo_container(
         if not isinstance(external_cam, ZedCamera):
             raise NotImplementedError(f"Recording requires a ZED external camera, got {type(external_cam).__name__}")
 
+    # Check perception servers are all up before slow cuRobo warmups
+    async def _check() -> None:
+        async with aiohttp.ClientSession() as session:
+            await check_server_health(session)
+
+    asyncio.run(_check())
+
     # Create depth estimator once — closed over camera intrinsics
     # Cache the SAM2 client
     sam2_client()
@@ -158,15 +171,19 @@ def get_demo_container(
 
 
 async def check_server_health(session: aiohttp.ClientSession):
-    """Check health of FoundationStereo and M2T2 server."""
+    """Check health of FoundationStereo, M2T2, and (optionally) RecGen servers."""
     from tiptop.perception.foundation_stereo import check_health_status as fs_check_health_status
     from tiptop.perception.m2t2 import check_health_status as m2t2_check_health_status
+    from tiptop.perception.recgen import check_health_status as recgen_check_health_status
 
     cfg = tiptop_cfg()
-    await asyncio.gather(
+    health_checks = [
         fs_check_health_status(session, cfg.perception.foundation_stereo.url),
         m2t2_check_health_status(session, cfg.perception.m2t2.url),
-    )
+    ]
+    if cfg.perception.recgen.enabled:
+        health_checks.append(recgen_check_health_status(session, cfg.perception.recgen.url))
+    await asyncio.gather(*health_checks)
     _log.info("Server health checks successful!")
 
 
@@ -297,17 +314,17 @@ def process_scene_geometry(
     masks: np.ndarray,
     bboxes: list,
     grasps: dict,
-    object_pcds: dict[str, o3d.geometry.PointCloud] | None = None,
+    recgen_meshes: dict[str, trimesh.Trimesh] | None = None,
 ) -> ProcessedScene:
     """Process perception results into 3D scene geometry for TAMP.
 
     Args:
         xyz_map: World-space XYZ coordinates (H, W, 3)
-        rgb_map: RGB image (H, W, 3) in 0-255 range
+        rgb_map: RGB image (H, W, 3) in 0-1 range
         masks: Segmentation masks from SAM2
         bboxes: Bounding boxes from Gemini
         grasps: Grasp predictions from M2T2
-        object_pcds: Optional pre-computed object point clouds
+        recgen_meshes: Per-object meshes in world frame (e.g. from RecGen). When provided, replaces the convex-hull path.
 
     Returns:
         ProcessedScene with table cuboid, object meshes, pcds, and filtered grasps
@@ -320,19 +337,45 @@ def process_scene_geometry(
     # For filtering to table plane height
     config = TAMPConfiguration()
     table_top_z = table_trimesh.bounds[1, 2] + config.world_activation_distance + config.coll_sphere_radius * 2
-    object_trimeshes, object_pcds_computed = segment_pointcloud_by_masks(
-        xyz_map,
-        rgb_map,
-        masks,
-        bboxes,
-        table_top_z,
-        return_pcd=True,
-        erode_pixels=tiptop_cfg().perception.mask_erosion_pixels,
-    )
+    if recgen_meshes is not None:
+        # Derive each object's point cloud from its mask, then apply the same table-relative z-filter + outlier removal
+        # the convex-hull path uses. Drop objects with too few above-table points. Keep object_trimeshes in sync with
+        # the surviving labels so downstream loops don't KeyError.
+        erode_pixels = tiptop_cfg().perception.mask_erosion_pixels
+        masks_2d = masks.squeeze(1).astype(bool)
+        object_pcds = {}
+        for mask_2d, bbox in zip(masks_2d, bboxes):
+            label = bbox["label"]
+            if label not in recgen_meshes:
+                _log.warning(f"Skipping {label}: no RecGen mesh for this label")
+                continue
+            points = masked_object_points(mask_2d, xyz_map, rgb_map, erode_pixels, label)
+            if points is None:
+                continue
+            _, xyz_obj, rgb_obj = points
+            keep = xyz_obj[:, 2] > table_top_z
+            if keep.sum() <= 10:
+                _log.warning(f"Skipping {label}: {keep.sum()} points above table (need > 10)")
+                continue
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(xyz_obj[keep])
+            pcd.colors = o3d.utility.Vector3dVector(rgb_obj[keep])
+            pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=10, std_ratio=2.0)
+            object_pcds[label] = pcd
+        object_trimeshes = {label: mesh for label, mesh in recgen_meshes.items() if label in object_pcds}
+    else:
+        object_trimeshes, object_pcds = segment_pointcloud_by_masks(
+            xyz_map,
+            rgb_map,
+            masks,
+            bboxes,
+            table_top_z,
+            return_pcd=True,
+            erode_pixels=tiptop_cfg().perception.mask_erosion_pixels,
+        )
 
-    # Use provided point clouds if available, otherwise use computed ones
-    if object_pcds is None:
-        object_pcds = object_pcds_computed
+    if not object_pcds:
+        raise ValueError("No objects with sufficient point cloud data; cannot associate grasps.")
 
     # Associate grasps with objects by checking contact point proximity
     # Build a single KDTree from all object points with label tracking
@@ -470,6 +513,7 @@ async def run_perception(
 ) -> tuple[TAMPEnvironment, list, ProcessedScene, list[dict]]:
     start_time = time.perf_counter()
 
+    cfg = tiptop_cfg()
     frame = observation.frame
     rgb = frame.rgb
     if log_to_rerun:
@@ -481,7 +525,7 @@ async def run_perception(
             session,
             frame,
             observation.world_from_cam,
-            tiptop_cfg().perception.voxel_downsample_size,
+            cfg.perception.voxel_downsample_size,
             depth_estimator=depth_estimator,
             gripper_mask=gripper_mask,
         ),
@@ -513,6 +557,22 @@ async def run_perception(
             ),
         )
 
+    # Reconstruct objects with RecGen (when enabled).
+    recgen_meshes: dict[str, trimesh.Trimesh] | None = None
+    if cfg.perception.recgen.enabled:
+        recgen_meshes = await reconstruct_objects_with_recgen(
+            session,
+            cfg.perception.recgen.url,
+            rgb_cam=rgb,
+            depth_cam=depth_results["depth_map"],
+            masks=detection_results["masks"],
+            bboxes=detection_results["bboxes"],
+            intrinsics=frame.intrinsics,
+            world_from_cam=observation.world_from_cam,
+            target_faces=cfg.perception.recgen.target_faces,
+            concurrency=cfg.perception.recgen.concurrency,
+        )
+
     # Run scene geometry processing while saving
     proc_st = time.perf_counter()
     process_coroutine = asyncio.to_thread(
@@ -522,6 +582,7 @@ async def run_perception(
         detection_results["masks"],
         detection_results["bboxes"],
         depth_results["grasps"],
+        recgen_meshes=recgen_meshes,
     )
     processed_scene, save_result = await asyncio.gather(process_coroutine, save_future)
 
@@ -608,7 +669,9 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             all_surfaces=all_surfaces,
                             experiment_dir=save_dir / "cutamp",
                         )
-                        _log.info(f"Perception and cuTAMP planning took: {perception_duration + planning_duration:.2f}s")
+                        _log.info(
+                            f"Perception and cuTAMP planning took: {perception_duration + planning_duration:.2f}s"
+                        )
                         if cutamp_plan is not None:
                             plan_path = save_dir / "tiptop_plan.json"
                             save_tiptop_plan(serialize_plan(cutamp_plan, observation.q_init), plan_path)

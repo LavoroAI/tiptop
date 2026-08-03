@@ -55,6 +55,19 @@ perception:
   sam:
     mode: "local"
 
+  recgen:
+    # ===== EXPERIMENTAL =====
+    # We support RecGen (https://reconstruction-by-generation.github.io) for shape completion instead of convex hulls.
+    # This is typically set to false as RecGen is significantly slower than convex hulls.
+    # For instructions to set up the RecGen server, see: https://github.com/williamshen-nz/recgen
+    # We recommend running it on a multi-GPU machine to speed up inference, as we generate completions per-object.
+    url: "http://<endpoint>:18324"
+    enabled: false
+    # Target mesh face count per object via decimation (applied server-side). Set to null to disable (huge meshes).
+    target_faces: 10000
+    # Maximum concurrent requests to RecGen inference server. Set at or slightly above gateway's GPU count.
+    concurrency: 6
+
   # Perception hyperparameters
   depth_trunc_m: 5.0             # Depth truncation threshold in meters
   voxel_downsample_size: 0.0075  # Point cloud downsampling in meters before feeding into M2T2
