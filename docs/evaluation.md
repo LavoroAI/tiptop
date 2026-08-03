@@ -66,6 +66,8 @@ We recommend `--enable-recording` for evaluations so you can review executions a
 
 See the [tiptop-run command reference](command-reference.md#tiptop-run) for the full list of options.
 
+TiPToP has experimental support for placing objects next to each other, and for shape completion in place of convex hulls. See [Experimental Features](experimental.md) for how to enable them.
+
 ### Labeling Results
 
 After each execution, you'll be prompted to label the rollout:

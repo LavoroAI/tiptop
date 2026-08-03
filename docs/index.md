@@ -56,6 +56,13 @@ Add support for a new robot arm or camera to TiPToP.
 Detailed documentation for TiPToP CLI commands including helper commands.
 :::
 
+:::{grid-item-card} 🧪 Experimental Features
+:link: experimental
+:link-type: doc
+
+Features that are still experimental and off by default.
+:::
+
 :::{grid-item-card} 🔧 Troubleshooting
 :link: troubleshooting
 :link-type: doc
@@ -115,6 +122,7 @@ simulation
 evaluation
 adding-new-embodiment
 command-reference
+experimental
 troubleshooting
 limitations
 contributing
